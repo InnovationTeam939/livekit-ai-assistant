@@ -1,6 +1,6 @@
 services:
-  # Backend Service (LiveKit Agent) - This should be a background worker, not web service
-  - type: background-worker
+  # Backend Service (LiveKit Agent) - Changed to web service to handle connections
+  - type: web
     name: moving-agent
     repo: https://github.com/Vel-12/livekit-voice-assistant
     rootDir: .
@@ -9,7 +9,7 @@ services:
     region: virginia
     
     buildCommand: pip install -r requirements.txt
-    startCommand: python agent.py dev
+    startCommand: python health_check.py
     
     envVars:
       - fromGroup: livekit-voice-assistant-env
