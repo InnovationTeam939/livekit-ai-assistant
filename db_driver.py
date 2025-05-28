@@ -5,6 +5,7 @@ from typing import Optional
 from dataclasses import dataclass
 import urllib.parse
 
+from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import sql
@@ -12,6 +13,8 @@ from psycopg2 import sql
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 @dataclass
 class MovingRequest:
@@ -34,6 +37,7 @@ class MovingRequest:
 class DatabaseDriver:
     def __init__(self, db_url: str = None):
         self.db_url = db_url or os.getenv("DATABASE_URL")
+        print(self.db_url)
         if not self.db_url:
             raise ValueError("DATABASE_URL environment variable must be set for PostgreSQL.")
         

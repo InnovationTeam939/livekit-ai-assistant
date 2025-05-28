@@ -8,6 +8,7 @@ from livekit.agents import ( # type: ignore
 )
 from livekit.agents.multimodal import MultimodalAgent # type: ignore
 from livekit.plugins import openai
+from livekit import rtc # type: ignore
 from dotenv import load_dotenv
 from api import AssistantFnc
 from prompts import WELCOME_MESSAGE, INSTRUCTIONS, LOOKUP_MOVING_INFO
@@ -15,6 +16,7 @@ import os
 import re
 import logging
 import sys
+import asyncio
 
 # Set up logging
 logging.basicConfig(
@@ -30,54 +32,67 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-async def entrypoint(ctx: JobContext):
-    """Main entry point for the LiveKit agent."""
-    logger.info("Starting LiveKit agent...")
+class CallSession:
+    """Manages a single call session with proper cleanup"""
     
-    try:
-        # Connect to the room
-        await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
-        await ctx.wait_for_participant()
+    def __init__(self, ctx: JobContext):
+        self.ctx = ctx
+        self.model = None
+        self.assistant = None
+        self.assistant_fnc = None
+        self.session = None
+        self.is_active = False
+        self.cleanup_done = False
         
-        logger.info("Participant connected, initializing model...")
-        
-        # Initialize the OpenAI Realtime model
-        model = openai.realtime.RealtimeModel(
-            instructions=INSTRUCTIONS,
-            voice="alloy",
-            temperature=0.8,
-            modalities=["audio", "text"]
-        )
-        
-        # Initialize assistant functions with error handling
+    async def initialize(self):
+        """Initialize the call session"""
         try:
-            assistant_fnc = AssistantFnc()
-            logger.info(f"Assistant functions initialized with request ID: {assistant_fnc.get_current_request_id()}")
-        except Exception as e:
-            logger.error(f"Failed to initialize assistant functions: {e}")
-            raise
-        
-        # Create the multimodal agent
-        assistant = MultimodalAgent(model=model, fnc_ctx=assistant_fnc)
-        assistant.start(ctx.room)
-        
-        logger.info("Agent started successfully")
-        
-        # Get the session and send welcome message
-        session = model.sessions[0]
-        session.conversation.item.create(
-            llm.ChatMessage(
-                role="assistant",
-                content=WELCOME_MESSAGE
+            logger.info("Initializing new call session...")
+            
+            # Initialize the OpenAI Realtime model
+            self.model = openai.realtime.RealtimeModel(
+                instructions=INSTRUCTIONS,
+                voice="alloy",
+                temperature=0.8,
+                modalities=["audio", "text"]
             )
-        )
-        session.response.create()
+            
+            # Initialize assistant functions with error handling
+            try:
+                self.assistant_fnc = AssistantFnc()
+                logger.info(f"Assistant functions initialized with request ID: {self.assistant_fnc.get_current_request_id()}")
+            except Exception as e:
+                logger.error(f"Failed to initialize assistant functions: {e}")
+                raise
+            
+            # Create the multimodal agent
+            self.assistant = MultimodalAgent(model=self.model, fnc_ctx=self.assistant_fnc)
+            self.assistant.start(self.ctx.room)
+            
+            # Get the session and set up event handlers
+            self.session = self.model.sessions[0]
+            self.setup_event_handlers()
+            
+            # Send welcome message
+            await self.send_welcome_message()
+            
+            self.is_active = True
+            logger.info("Call session initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize call session: {e}")
+            await self.cleanup()
+            raise
+    
+    def setup_event_handlers(self):
+        """Set up event handlers for the session"""
         
-        logger.info("Welcome message sent")
-        
-        @session.on("user_speech_committed")
+        @self.session.on("user_speech_committed")
         def on_user_speech_committed(msg: llm.ChatMessage):
             """Handle user speech input."""
+            if not self.is_active:
+                return
+                
             logger.info(f"User speech committed: {msg.content}")
             
             try:
@@ -94,107 +109,243 @@ async def entrypoint(ctx: JobContext):
                 
                 # Check if user wants to look up their details
                 if any(keyword in content_lower for keyword in ["check", "look up", "my details", "request id", "lookup"]):
-                    handle_lookup_request(msg)
+                    self.handle_lookup_request(msg)
                 else:
                     # Check if we have a complete moving request
-                    if assistant_fnc.has_moving_request():
-                        handle_query(msg)
+                    if self.assistant_fnc.has_moving_request():
+                        self.handle_query(msg)
                     else:
-                        collect_moving_info(msg)
+                        self.collect_moving_info(msg)
                         
             except Exception as e:
                 logger.error(f"Error processing user message: {str(e)}")
-                send_error_response("I apologize, but I encountered an error processing your request. Could you please try again?")
-        
-        def send_error_response(message: str):
-            """Send an error response to the user."""
-            try:
-                session.conversation.item.create(
-                    llm.ChatMessage(
-                        role="system",
-                        content=message
-                    )
+                self.send_error_response("I apologize, but I encountered an error processing your request. Could you please try again?")
+    
+    async def send_welcome_message(self):
+        """Send welcome message to the user"""
+        try:
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="assistant",
+                    content=WELCOME_MESSAGE
                 )
-                session.response.create()
-            except Exception as e:
-                logger.error(f"Failed to send error response: {e}")
-        
-        def handle_lookup_request(msg: llm.ChatMessage):
-            """Handle request ID lookup."""
-            logger.info("Handling lookup request")
+            )
+            self.session.response.create()
+            logger.info("Welcome message sent")
+        except Exception as e:
+            logger.error(f"Failed to send welcome message: {e}")
+    
+    def send_error_response(self, message: str):
+        """Send an error response to the user."""
+        if not self.is_active or not self.session:
+            return
             
-            try:
-                # Extract request ID if present in the message
-                request_id_match = re.search(r'\b\d{6}\b', msg.content)
-                if request_id_match:
-                    request_id = request_id_match.group(0)
-                    logger.info(f"Looking up request ID: {request_id}")
-                    
-                    try:
-                        result = assistant_fnc.lookup_moving_request(request_id)
-                        session.conversation.item.create(
-                            llm.ChatMessage(
-                                role="system",
-                                content=f"Looking up request ID: {request_id}\n{result}"
-                            )
-                        )
-                    except Exception as e:
-                        logger.error(f"Error looking up request: {str(e)}")
-                        session.conversation.item.create(
-                            llm.ChatMessage(
-                                role="system",
-                                content="I encountered an error looking up your request. Please verify your request ID and try again."
-                            )
-                        )
-                else:
-                    session.conversation.item.create(
+        try:
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="system",
+                    content=message
+                )
+            )
+            self.session.response.create()
+        except Exception as e:
+            logger.error(f"Failed to send error response: {e}")
+    
+    def handle_lookup_request(self, msg: llm.ChatMessage):
+        """Handle request ID lookup."""
+        if not self.is_active:
+            return
+            
+        logger.info("Handling lookup request")
+        
+        try:
+            # Extract request ID if present in the message
+            request_id_match = re.search(r'\b\d{6}\b', msg.content)
+            if request_id_match:
+                request_id = request_id_match.group(0)
+                logger.info(f"Looking up request ID: {request_id}")
+                
+                try:
+                    result = self.assistant_fnc.lookup_moving_request(request_id)
+                    self.session.conversation.item.create(
                         llm.ChatMessage(
                             role="system",
-                            content="I'll need your request ID to look up your details. Could you please provide your 6-digit request ID?"
+                            content=f"Looking up request ID: {request_id}\n{result}"
                         )
                     )
-                
-                session.response.create()
-                
-            except Exception as e:
-                logger.error(f"Error in handle_lookup_request: {e}")
-                send_error_response("I encountered an error processing your lookup request. Please try again.")
-        
-        def collect_moving_info(msg: llm.ChatMessage):
-            """Collect moving information from user."""
-            logger.info("Collecting moving information")
-            
-            try:
-                session.conversation.item.create(
+                except Exception as e:
+                    logger.error(f"Error looking up request: {str(e)}")
+                    self.session.conversation.item.create(
+                        llm.ChatMessage(
+                            role="system",
+                            content="I encountered an error looking up your request. Please verify your request ID and try again."
+                        )
+                    )
+            else:
+                self.session.conversation.item.create(
                     llm.ChatMessage(
                         role="system",
-                        content=LOOKUP_MOVING_INFO(msg)
+                        content="I'll need your request ID to look up your details. Could you please provide your 6-digit request ID?"
                     )
                 )
-                session.response.create()
-            except Exception as e:
-                logger.error(f"Error collecting moving info: {str(e)}")
-                send_error_response("I apologize, but I encountered an error while processing your information. Could you please repeat that?")
             
-        def handle_query(msg: llm.ChatMessage):
-            """Handle general queries when we have a complete moving request."""
-            logger.info("Handling general query")
+            self.session.response.create()
             
+        except Exception as e:
+            logger.error(f"Error in handle_lookup_request: {e}")
+            self.send_error_response("I encountered an error processing your lookup request. Please try again.")
+    
+    def collect_moving_info(self, msg: llm.ChatMessage):
+        """Collect moving information from user."""
+        if not self.is_active:
+            return
+            
+        logger.info("Collecting moving information")
+        
+        try:
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="system",
+                    content=LOOKUP_MOVING_INFO(msg)
+                )
+            )
+            self.session.response.create()
+        except Exception as e:
+            logger.error(f"Error collecting moving info: {str(e)}")
+            self.send_error_response("I apologize, but I encountered an error while processing your information. Could you please repeat that?")
+        
+    def handle_query(self, msg: llm.ChatMessage):
+        """Handle general queries when we have a complete moving request."""
+        if not self.is_active:
+            return
+            
+        logger.info("Handling general query")
+        
+        try:
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="user",
+                    content=msg.content
+                )
+            )
+            self.session.response.create()
+        except Exception as e:
+            logger.error(f"Error handling query: {str(e)}")
+            self.send_error_response("I apologize, but I encountered an error processing your query. Could you please try again?")
+    
+    async def cleanup(self):
+        """Clean up resources when call ends"""
+        if self.cleanup_done:
+            return
+            
+        logger.info("Cleaning up call session...")
+        
+        try:
+            self.is_active = False
+            
+            if self.assistant:
+                try:
+                    # Stop the assistant gracefully
+                    await asyncio.wait_for(self.assistant.aclose(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Assistant cleanup timed out")
+                except Exception as e:
+                    logger.error(f"Error stopping assistant: {e}")
+                finally:
+                    self.assistant = None
+            
+            # Clear references
+            self.model = None
+            self.session = None
+            self.assistant_fnc = None
+            
+            self.cleanup_done = True
+            logger.info("Call session cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+
+async def entrypoint(ctx: JobContext):
+    """Main entry point for the LiveKit agent - handles multiple calls"""
+    logger.info("Starting LiveKit agent...")
+    
+    # Keep track of active sessions
+    active_sessions = {}
+    
+    try:
+        # Connect to the room
+        await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
+        logger.info("Connected to room, waiting for participants...")
+        
+        @ctx.room.on("participant_connected")
+        def on_participant_connected(participant: rtc.RemoteParticipant):
+            """Handle new participant connection"""
+            logger.info(f"Participant connected: {participant.identity}")
+            
+            # Create a new session for this participant
+            session = CallSession(ctx)
+            active_sessions[participant.identity] = session
+            
+            # Initialize the session asynchronously
+            asyncio.create_task(initialize_session(session, participant))
+        
+        @ctx.room.on("participant_disconnected")
+        def on_participant_disconnected(participant: rtc.RemoteParticipant):
+            """Handle participant disconnection"""
+            logger.info(f"Participant disconnected: {participant.identity}")
+            
+            # Clean up the session for this participant
+            if participant.identity in active_sessions:
+                session = active_sessions[participant.identity]
+                asyncio.create_task(session.cleanup())
+                del active_sessions[participant.identity]
+        
+        # Keep the agent running
+        while True:
             try:
-                session.conversation.item.create(
-                    llm.ChatMessage(
-                        role="user",
-                        content=msg.content
-                    )
-                )
-                session.response.create()
+                await asyncio.sleep(1)
+                
+                # Clean up any disconnected sessions
+                disconnected_sessions = []
+                for identity, session in active_sessions.items():
+                    if not session.is_active and not session.cleanup_done:
+                        disconnected_sessions.append(identity)
+                
+                for identity in disconnected_sessions:
+                    if identity in active_sessions:
+                        await active_sessions[identity].cleanup()
+                        del active_sessions[identity]
+                        
+            except KeyboardInterrupt:
+                logger.info("Received shutdown signal")
+                break
             except Exception as e:
-                logger.error(f"Error handling query: {str(e)}")
-                send_error_response("I apologize, but I encountered an error processing your query. Could you please try again?")
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(5)  # Wait before retrying
     
     except Exception as e:
         logger.error(f"Critical error in entrypoint: {e}")
         raise
+    finally:
+        # Clean up all active sessions
+        logger.info("Cleaning up all active sessions...")
+        cleanup_tasks = []
+        for session in active_sessions.values():
+            cleanup_tasks.append(session.cleanup())
+        
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        
+        logger.info("Agent shutdown complete")
+
+async def initialize_session(session: CallSession, participant):
+    """Initialize a session for a participant"""
+    try:
+        await session.initialize()
+        logger.info(f"Session initialized for participant: {participant.identity}")
+    except Exception as e:
+        logger.error(f"Failed to initialize session for {participant.identity}: {e}")
+        await session.cleanup()
 
 def validate_environment():
     """Validate that all required environment variables are set."""

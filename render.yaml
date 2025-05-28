@@ -1,5 +1,33 @@
 services:
-  # Frontend Service (Streamlit Dashboard)
+  # Backend Service (LiveKit Agent) - This should be a background worker, not web service
+  - type: background-worker
+    name: moving-agent
+    repo: https://github.com/Vel-12/livekit-voice-assistant
+    rootDir: .
+    runtime: python
+    plan: starter
+    region: virginia
+    
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent.py dev
+    
+    envVars:
+      - fromGroup: livekit-voice-assistant-env
+    
+    # Health check configuration
+    healthCheckPath: /health
+    
+    # Auto-restart configuration
+    autoDeploy: true
+    
+    # Resource limits for better stability
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+      targetCPUPercent: 70
+      targetMemoryPercent: 80
+
+  # Optional: Frontend Service (Streamlit Dashboard) - Only if you need a web interface
   - type: web
     name: moving-frontend
     repo: https://github.com/Vel-12/livekit-voice-assistant
@@ -10,27 +38,6 @@ services:
     
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run frontend.py --server.port=$PORT --server.address=0.0.0.0
-    
-    envVars:
-      - fromGroup: livekit-voice-assistant-env
-    
-    scaling:
-      minInstances: 1
-      maxInstances: 2
-      targetCPUPercent: 60
-      targetMemoryPercent: 60
-
-  # Backend Service (LiveKit Agent)
-  - type: worker
-    name: moving-backend
-    repo: https://github.com/Vel-12/livekit-voice-assistant
-    rootDir: .
-    runtime: python
-    plan: starter
-    region: virginia
-    
-    buildCommand: pip install -r requirements.txt
-    startCommand: python agent.py
     
     envVars:
       - fromGroup: livekit-voice-assistant-env
