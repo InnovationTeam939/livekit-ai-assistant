@@ -17,8 +17,6 @@ import re
 import logging
 import sys
 import asyncio
-import threading
-import time
 
 # Set up logging
 logging.basicConfig(
@@ -35,7 +33,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 class CallSession:
-    """Manages a single call session with proper cleanup and error handling"""
+    """Manages a single call session with proper cleanup"""
     
     def __init__(self, ctx: JobContext):
         self.ctx = ctx
@@ -45,23 +43,18 @@ class CallSession:
         self.session = None
         self.is_active = False
         self.cleanup_done = False
-        self.response_lock = asyncio.Lock()
-        self.last_response_time = 0
-        self.response_cooldown = 1.0  # Minimum time between responses
         
     async def initialize(self):
         """Initialize the call session"""
         try:
             logger.info("Initializing new call session...")
             
-            # Initialize the OpenAI Realtime model with better configuration
+            # Initialize the OpenAI Realtime model
             self.model = openai.realtime.RealtimeModel(
                 instructions=INSTRUCTIONS,
                 voice="alloy",
                 temperature=0.8,
-                modalities=["audio", "text"],
-                # Add timeout and retry configurations
-                turn_detection={"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500}
+                modalities=["audio", "text"]
             )
             
             # Initialize assistant functions with error handling
@@ -72,27 +65,16 @@ class CallSession:
                 logger.error(f"Failed to initialize assistant functions: {e}")
                 raise
             
-            # Create the multimodal agent with error handling
+            # Create the multimodal agent
             self.assistant = MultimodalAgent(model=self.model, fnc_ctx=self.assistant_fnc)
-            
-            # Wait for the session to be ready before setting up handlers
-            await asyncio.sleep(0.5)  # Give the model time to initialize
-            
             self.assistant.start(self.ctx.room)
             
             # Get the session and set up event handlers
-            if not self.model.sessions:
-                await asyncio.sleep(1.0)  # Wait longer for session initialization
+            self.session = self.model.sessions[0]
+            self.setup_event_handlers()
             
-            if self.model.sessions:
-                self.session = self.model.sessions[0]
-                self.setup_event_handlers()
-                
-                # Send welcome message with delay
-                await asyncio.sleep(1.0)
-                await self.send_welcome_message()
-            else:
-                raise Exception("Failed to initialize OpenAI Realtime session")
+            # Send welcome message
+            await self.send_welcome_message()
             
             self.is_active = True
             logger.info("Call session initialized successfully")
@@ -103,126 +85,75 @@ class CallSession:
             raise
     
     def setup_event_handlers(self):
-        """Set up event handlers for the session with better error handling"""
+        """Set up event handlers for the session"""
         
         @self.session.on("user_speech_committed")
         def on_user_speech_committed(msg: llm.ChatMessage):
-            """Handle user speech input with rate limiting."""
-            if not self.is_active or not self.session:
-                logger.warning("Received speech input but session is not active")
+            """Handle user speech input."""
+            if not self.is_active:
                 return
                 
             logger.info(f"User speech committed: {msg.content}")
             
-            # Run async handler in a safe way
-            asyncio.create_task(self._handle_user_message(msg))
-        
-        @self.session.on("response_done")
-        def on_response_done(response):
-            """Handle response completion"""
-            logger.debug(f"Response done: {response}")
-        
-        @self.session.on("error")
-        def on_session_error(error):
-            """Handle session errors"""
-            logger.error(f"Session error: {error}")
-            if self.is_active:
-                asyncio.create_task(self.send_error_response("I encountered an error. Please try again."))
-    
-    async def _handle_user_message(self, msg: llm.ChatMessage):
-        """Handle user message with proper error handling and rate limiting"""
-        try:
-            # Rate limiting to prevent rapid-fire requests
-            current_time = time.time()
-            if current_time - self.last_response_time < self.response_cooldown:
-                logger.debug("Rate limiting: too soon for another response")
-                return
-            
-            async with self.response_lock:
-                if not self.is_active or not self.session:
-                    return
+            try:
+                # Handle list content (images, etc.)
+                if isinstance(msg.content, list):
+                    msg.content = "\n".join("[image]" if isinstance(x, llm.ChatImage) else str(x) for x in msg.content)
                 
-                try:
-                    # Handle list content (images, etc.)
-                    if isinstance(msg.content, list):
-                        msg.content = "\n".join("[image]" if isinstance(x, llm.ChatImage) else str(x) for x in msg.content)
-                    
-                    # Ensure content is a string
-                    if not isinstance(msg.content, str):
-                        msg.content = str(msg.content)
-                    
-                    # Route the message based on content
-                    content_lower = msg.content.lower()
-                    
-                    # Check if user wants to look up their details
-                    if any(keyword in content_lower for keyword in ["check", "look up", "my details", "request id", "lookup"]):
-                        await self.handle_lookup_request(msg)
+                # Ensure content is a string
+                if not isinstance(msg.content, str):
+                    msg.content = str(msg.content)
+                
+                # Route the message based on content
+                content_lower = msg.content.lower()
+                
+                # Check if user wants to look up their details
+                if any(keyword in content_lower for keyword in ["check", "look up", "my details", "request id", "lookup"]):
+                    self.handle_lookup_request(msg)
+                else:
+                    # Check if we have a complete moving request
+                    if self.assistant_fnc.has_moving_request():
+                        self.handle_query(msg)
                     else:
-                        # Check if we have a complete moving request
-                        if self.assistant_fnc.has_moving_request():
-                            await self.handle_query(msg)
-                        else:
-                            await self.collect_moving_info(msg)
-                    
-                    self.last_response_time = current_time
-                    
-                except Exception as e:
-                    logger.error(f"Error processing user message: {str(e)}")
-                    await self.send_error_response("I apologize, but I encountered an error processing your request. Could you please try again?")
-                    
-        except Exception as e:
-            logger.error(f"Critical error in _handle_user_message: {e}")
+                        self.collect_moving_info(msg)
+                        
+            except Exception as e:
+                logger.error(f"Error processing user message: {str(e)}")
+                self.send_error_response("I apologize, but I encountered an error processing your request. Could you please try again?")
     
     async def send_welcome_message(self):
-        """Send welcome message to the user with better error handling"""
-        if not self.is_active or not self.session:
-            return
-            
+        """Send welcome message to the user"""
         try:
-            async with self.response_lock:
-                # Check if there's already a response in progress
-                if hasattr(self.session, '_current_response') and self.session._current_response:
-                    logger.debug("Waiting for current response to complete before sending welcome message")
-                    await asyncio.sleep(2.0)
-                
-                self.session.conversation.item.create(
-                    llm.ChatMessage(
-                        role="assistant",
-                        content=WELCOME_MESSAGE
-                    )
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="assistant",
+                    content=WELCOME_MESSAGE
                 )
-                
-                # Add a small delay before creating response
-                await asyncio.sleep(0.1)
-                self.session.response.create()
-                logger.info("Welcome message sent")
-                
+            )
+            self.session.response.create()
+            logger.info("Welcome message sent")
         except Exception as e:
             logger.error(f"Failed to send welcome message: {e}")
-            # Don't raise here as this shouldn't break the session
     
-    async def send_error_response(self, message: str):
-        """Send an error response to the user with proper error handling."""
+    def send_error_response(self, message: str):
+        """Send an error response to the user."""
         if not self.is_active or not self.session:
             return
             
         try:
-            async with self.response_lock:
-                self.session.conversation.item.create(
-                    llm.ChatMessage(
-                        role="system",
-                        content=message
-                    )
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="system",
+                    content=message
                 )
-                await asyncio.sleep(0.1)  # Small delay to prevent race conditions
-                self.session.response.create()
-                
+            )
+            self.session.response.create()
         except Exception as e:
             logger.error(f"Failed to send error response: {e}")
     
-    async def handle_lookup_request(self, msg: llm.ChatMessage):
-        """Handle request ID lookup with better error handling."""
-        if not self.is_active or not self.session:
+    def handle_lookup_request(self, msg: llm.ChatMessage):
+        """Handle request ID lookup."""
+        if not self.is_active:
             return
             
         logger.info("Handling lookup request")
@@ -236,73 +167,74 @@ class CallSession:
                 
                 try:
                     result = self.assistant_fnc.lookup_moving_request(request_id)
-                    response_content = f"Looking up request ID: {request_id}\n{result}"
+                    self.session.conversation.item.create(
+                        llm.ChatMessage(
+                            role="system",
+                            content=f"Looking up request ID: {request_id}\n{result}"
+                        )
+                    )
                 except Exception as e:
                     logger.error(f"Error looking up request: {str(e)}")
-                    response_content = "I encountered an error looking up your request. Please verify your request ID and try again."
+                    self.session.conversation.item.create(
+                        llm.ChatMessage(
+                            role="system",
+                            content="I encountered an error looking up your request. Please verify your request ID and try again."
+                        )
+                    )
             else:
-                response_content = "I'll need your request ID to look up your details. Could you please provide your 6-digit request ID?"
-            
-            async with self.response_lock:
                 self.session.conversation.item.create(
                     llm.ChatMessage(
                         role="system",
-                        content=response_content
+                        content="I'll need your request ID to look up your details. Could you please provide your 6-digit request ID?"
                     )
                 )
-                await asyncio.sleep(0.1)
-                self.session.response.create()
+            
+            self.session.response.create()
             
         except Exception as e:
             logger.error(f"Error in handle_lookup_request: {e}")
-            await self.send_error_response("I encountered an error processing your lookup request. Please try again.")
+            self.send_error_response("I encountered an error processing your lookup request. Please try again.")
     
-    async def collect_moving_info(self, msg: llm.ChatMessage):
-        """Collect moving information from user with better error handling."""
-        if not self.is_active or not self.session:
+    def collect_moving_info(self, msg: llm.ChatMessage):
+        """Collect moving information from user."""
+        if not self.is_active:
             return
             
         logger.info("Collecting moving information")
         
         try:
-            async with self.response_lock:
-                self.session.conversation.item.create(
-                    llm.ChatMessage(
-                        role="system",
-                        content=LOOKUP_MOVING_INFO(msg)
-                    )
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="system",
+                    content=LOOKUP_MOVING_INFO(msg)
                 )
-                await asyncio.sleep(0.1)
-                self.session.response.create()
-                
+            )
+            self.session.response.create()
         except Exception as e:
             logger.error(f"Error collecting moving info: {str(e)}")
-            await self.send_error_response("I apologize, but I encountered an error while processing your information. Could you please repeat that?")
+            self.send_error_response("I apologize, but I encountered an error while processing your information. Could you please repeat that?")
         
-    async def handle_query(self, msg: llm.ChatMessage):
+    def handle_query(self, msg: llm.ChatMessage):
         """Handle general queries when we have a complete moving request."""
-        if not self.is_active or not self.session:
+        if not self.is_active:
             return
             
         logger.info("Handling general query")
         
         try:
-            async with self.response_lock:
-                self.session.conversation.item.create(
-                    llm.ChatMessage(
-                        role="user",
-                        content=msg.content
-                    )
+            self.session.conversation.item.create(
+                llm.ChatMessage(
+                    role="user",
+                    content=msg.content
                 )
-                await asyncio.sleep(0.1)
-                self.session.response.create()
-                
+            )
+            self.session.response.create()
         except Exception as e:
             logger.error(f"Error handling query: {str(e)}")
-            await self.send_error_response("I apologize, but I encountered an error processing your query. Could you please try again?")
+            self.send_error_response("I apologize, but I encountered an error processing your query. Could you please try again?")
     
     async def cleanup(self):
-        """Clean up resources when call ends with better error handling"""
+        """Clean up resources when call ends"""
         if self.cleanup_done:
             return
             
@@ -311,18 +243,10 @@ class CallSession:
         try:
             self.is_active = False
             
-            # Cancel any pending responses first
-            if self.session:
-                try:
-                    # Give any in-progress operations time to complete
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.warning(f"Error during session cleanup delay: {e}")
-            
             if self.assistant:
                 try:
-                    # Stop the assistant gracefully with timeout
-                    await asyncio.wait_for(self.assistant.aclose(), timeout=10.0)
+                    # Stop the assistant gracefully
+                    await asyncio.wait_for(self.assistant.aclose(), timeout=5.0)
                 except asyncio.TimeoutError:
                     logger.warning("Assistant cleanup timed out")
                 except Exception as e:
@@ -370,12 +294,6 @@ async def entrypoint(ctx: JobContext):
             """Handle new participant connection"""
             logger.info(f"Participant connected: {participant.identity}")
             
-            # Clean up any existing session for this participant first
-            if participant.identity in active_sessions:
-                old_session = active_sessions[participant.identity]
-                asyncio.create_task(old_session.cleanup())
-                del active_sessions[participant.identity]
-            
             # Create a new session for this participant
             session = CallSession(ctx)
             active_sessions[participant.identity] = session
@@ -397,9 +315,9 @@ async def entrypoint(ctx: JobContext):
         # Keep the agent running with better error handling
         while True:
             try:
-                await asyncio.sleep(5)  # Increased sleep time
+                await asyncio.sleep(1)
                 
-                # Health check and cleanup of stale sessions
+                # Clean up any disconnected sessions
                 disconnected_sessions = []
                 for identity, session in active_sessions.items():
                     if not session.is_active and not session.cleanup_done:
@@ -407,7 +325,6 @@ async def entrypoint(ctx: JobContext):
                 
                 for identity in disconnected_sessions:
                     if identity in active_sessions:
-                        logger.info(f"Cleaning up stale session for {identity}")
                         await active_sessions[identity].cleanup()
                         del active_sessions[identity]
                         
@@ -416,7 +333,7 @@ async def entrypoint(ctx: JobContext):
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
-                await asyncio.sleep(10)  # Wait longer before retrying after error
+                await asyncio.sleep(5)  # Wait before retrying
     
     except Exception as e:
         logger.error(f"Critical error in entrypoint: {e}")
@@ -429,18 +346,12 @@ async def entrypoint(ctx: JobContext):
             cleanup_tasks.append(session.cleanup())
         
         if cleanup_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
-                    timeout=30.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Session cleanup timed out")
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
         
         logger.info("Agent shutdown complete")
 
 async def initialize_session(session: CallSession, participant):
-    """Initialize a session for a participant with error handling"""
+    """Initialize a session for a participant"""
     try:
         await session.initialize()
         logger.info(f"Session initialized for participant: {participant.identity}")
@@ -526,6 +437,9 @@ def main():
         # Only raise if we're in the main thread
         if threading.current_thread() is threading.main_thread():
             raise
+
+# Import threading for thread detection
+import threading
 
 if __name__ == "__main__":
     main()
