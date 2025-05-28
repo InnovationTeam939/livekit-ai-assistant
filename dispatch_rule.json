@@ -1,0 +1,11 @@
+{
+    "name": "Inbound Dispatch Rule",
+    "trunk_ids": [
+        "ST_bKktycaHLgsv"
+    ],
+    "rule": {
+        "dispatchRuleIndividual": {
+            "roomPrefix": "call-"
+        }
+    }
+}
